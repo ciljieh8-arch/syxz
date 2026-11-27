@@ -28,6 +28,21 @@ enum class BundleCompressionMode(val flagCode: Int, val label: String) {
  */
 object AssetBundleWriter {
 
+  fun detectPreferredCompressionMode(bundle: ParsedAssetBundle): BundleCompressionMode {
+    val blockCode = bundle.blocks
+      .map { it.compressionType }
+      .firstOrNull { it in 1..3 }
+      ?: bundle.blocks.firstOrNull()?.compressionType
+      ?: ((bundle.header.flags ?: 3) and 0x3F)
+    return when (blockCode) {
+      0 -> BundleCompressionMode.NONE
+      1 -> BundleCompressionMode.LZMA
+      2 -> BundleCompressionMode.LZ4
+      3 -> BundleCompressionMode.LZ4HC
+      else -> BundleCompressionMode.LZ4HC
+    }
+  }
+
   fun rebuildUnityFsToTempFile(
     originalSource: SeekableByteSource,
     originalBundle: ParsedAssetBundle,

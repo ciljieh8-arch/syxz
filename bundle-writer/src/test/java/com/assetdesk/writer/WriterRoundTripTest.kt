@@ -4,6 +4,7 @@ import com.assetdesk.binary.BinaryWriter
 import com.assetdesk.binary.ByteArrayByteSource
 import com.assetdesk.binary.ByteOrderMode
 import com.assetdesk.binary.Lz4Codec
+import com.assetdesk.binary.LzmaCodec
 import com.assetdesk.model.ObjectStatus
 import com.assetdesk.unity.AssetBundleParser
 import com.assetdesk.unity.SerializedFileParser
@@ -93,6 +94,78 @@ class WriterRoundTripTest {
     assertEquals(newObj.size.toLong(), reSf.objects[0].byteSize)
   }
 
+  @Test
+  fun `AssetBundleWriter preserves original compression and keeps trailing objects intact when earlier object shrinks`() {
+    val firstObj = BinaryWriter(ByteOrderMode.LITTLE_ENDIAN).apply {
+      writeLengthPrefixedString("shader_a", true)
+      writeLengthPrefixedString("X".repeat(400), true)
+    }.toByteArray()
+    val lastObj = BinaryWriter(ByteOrderMode.LITTLE_ENDIAN).apply {
+      writeLengthPrefixedString("shader_last", true)
+      writeLengthPrefixedString("TrailingPayloadPreserved_999", true)
+    }.toByteArray()
+
+    val innerSf = buildMultiObjectSerializedFile(
+      listOf(
+        1001L to firstObj,
+        9026648381118478326L to lastObj,
+      ),
+    )
+
+    for (compressionCode in listOf(0, 1, 2, 3)) {
+      val bundleBytes = buildSimpleUnityFs("CAB-multi", innerSf, blockCompression = compressionCode)
+      val bundleSource = ByteArrayByteSource(bundleBytes)
+      val parsedBundle = AssetBundleParser.parse(bundleSource, "multi_$compressionCode.bundle").getOrThrow()
+      val detectedMode = AssetBundleWriter.detectPreferredCompressionMode(parsedBundle)
+      assertEquals(compressionCode, detectedMode.flagCode)
+
+      val originalEntry = AssetBundleParser.extractEntryBytes(
+        bundleSource,
+        parsedBundle,
+        parsedBundle.directoryEntries.first(),
+      ).getOrThrow()
+      val parsedSf = SerializedFileParser.parse(ByteArrayByteSource(originalEntry), "CAB-multi").getOrThrow()
+
+      // Shrink the first object significantly (like editing a dump) and rebuild using original entry as source
+      val shrunkFirstObj = BinaryWriter(ByteOrderMode.LITTLE_ENDIAN).apply {
+        writeLengthPrefixedString("shader_a", true)
+        writeLengthPrefixedString("Short", true)
+      }.toByteArray()
+      val updatedSf = parsedSf.copy(
+        objects = parsedSf.objects.map { obj ->
+          if (obj.pathId == 1001L) obj.copy(modifiedRawBytes = shrunkFirstObj, status = ObjectStatus.MODIFIED)
+          else obj
+        },
+      )
+
+      val serializedEntry = SerializedFileWriter.serializeToByteArray(
+        ByteArrayByteSource(originalEntry),
+        updatedSf,
+      )
+      val rebuiltFile = AssetBundleWriter.rebuildUnityFsToTempFile(
+        originalSource = bundleSource,
+        originalBundle = parsedBundle,
+        replacedEntries = mapOf("CAB-multi" to serializedEntry),
+        compressionMode = detectedMode,
+        tempDirectory = tempFolder.root,
+      ).getOrThrow()
+
+      val rebuiltBytes = rebuiltFile.readBytes()
+      val reBundle = AssetBundleParser.parse(ByteArrayByteSource(rebuiltBytes), "out.bundle").getOrThrow()
+      assertEquals(compressionCode, reBundle.blocks.first().compressionType)
+      val extracted = AssetBundleParser.extractEntryBytes(
+        ByteArrayByteSource(rebuiltBytes),
+        reBundle,
+        reBundle.directoryEntries.first(),
+      ).getOrThrow()
+      val reSf = SerializedFileParser.parse(ByteArrayByteSource(extracted), "CAB-multi").getOrThrow()
+      assertEquals(2, reSf.objects.size)
+      assertEquals(shrunkFirstObj.size.toLong(), reSf.objects[0].byteSize)
+      assertEquals(lastObj.size.toLong(), reSf.objects[1].byteSize)
+      assertEquals("shader_last", reSf.objects[1].assetName)
+    }
+  }
+
   private fun buildSerializedFile(
     name: String,
     body: String,
@@ -140,14 +213,80 @@ class WriterRoundTripTest {
     return out.toByteArray()
   }
 
-  private fun buildSimpleUnityFs(entryName: String, payload: ByteArray): ByteArray {
-    val compPayload = Lz4Codec.compressBlock(payload)
+  private fun buildMultiObjectSerializedFile(
+    items: List<Pair<Long, ByteArray>>,
+    endian: ByteOrderMode = ByteOrderMode.LITTLE_ENDIAN,
+  ): ByteArray {
+    val dataOut = java.io.ByteArrayOutputStream()
+    val starts = LongArray(items.size)
+    var cursor = 0L
+    items.forEachIndexed { idx, (_, bytes) ->
+      val pad = ((8L - (cursor % 8L)) % 8L).toInt()
+      if (pad > 0) {
+        dataOut.write(ByteArray(pad))
+        cursor += pad
+      }
+      starts[idx] = cursor
+      dataOut.write(bytes)
+      cursor += bytes.size
+    }
+    val dataBytes = dataOut.toByteArray()
+
+    val meta = BinaryWriter(endian)
+    meta.writeNullTerminatedString("2018.4.36f1")
+    meta.writeInt32(13)
+    meta.writeBoolean(false)
+    meta.writeInt32(1)
+    meta.writeInt32(49)
+    meta.writeBoolean(false)
+    meta.writeInt16(-1)
+    meta.writeBytes(ByteArray(16))
+
+    meta.writeInt32(items.size)
+    items.forEachIndexed { idx, (pathId, bytes) ->
+      meta.align(4)
+      meta.writeInt64(pathId)
+      meta.writeUInt32(starts[idx])
+      meta.writeUInt32(bytes.size.toLong())
+      meta.writeInt32(0)
+    }
+    meta.writeInt32(0)
+    meta.writeInt32(0)
+    val metaBytes = meta.toByteArray()
+
+    val dataOffset = ((20L + metaBytes.size + 15L) / 16L) * 16L
+    val pad = (dataOffset - 20L - metaBytes.size).toInt()
+    val totalSize = dataOffset + dataBytes.size
+
+    val out = BinaryWriter(ByteOrderMode.BIG_ENDIAN, totalSize.toInt())
+    out.writeUInt32(metaBytes.size.toLong())
+    out.writeUInt32(totalSize)
+    out.writeInt32(17)
+    out.writeUInt32(dataOffset)
+    out.writeUInt8(if (endian == ByteOrderMode.BIG_ENDIAN) 1 else 0)
+    out.writeZeroBytes(3L)
+    out.writeBytes(metaBytes)
+    if (pad > 0) out.writeZeroBytes(pad.toLong())
+    out.writeBytes(dataBytes)
+    return out.toByteArray()
+  }
+
+  private fun buildSimpleUnityFs(
+    entryName: String,
+    payload: ByteArray,
+    blockCompression: Int = 3,
+  ): ByteArray {
+    val compPayload = when (blockCompression) {
+      0 -> payload
+      1 -> LzmaCodec.compressUnityFsBlock(payload)
+      else -> Lz4Codec.compressBlock(payload)
+    }
     val info = BinaryWriter(ByteOrderMode.BIG_ENDIAN)
     info.writeZeroBytes(16L)
     info.writeInt32(1)
     info.writeUInt32(payload.size.toLong())
     info.writeUInt32(compPayload.size.toLong())
-    info.writeUInt16(3)
+    info.writeUInt16(blockCompression)
     info.writeInt32(1)
     info.writeInt64(0L)
     info.writeInt64(payload.size.toLong())

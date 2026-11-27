@@ -18,6 +18,7 @@ import com.assetdesk.plugins.PluginInspectionResult
 import com.assetdesk.plugins.TextAssetPlugin
 import com.assetdesk.plugins.TexturePlugin
 import com.assetdesk.unity.BundleDirectoryEntry
+import com.assetdesk.unity.UnityFileKind
 import com.example.data.SafFileRepository
 import com.example.data.WorkspacePreferencesRepository
 import com.example.model.AppSettingsState
@@ -259,11 +260,15 @@ class AssetDeskViewModel(
         memoryLimitMb = memoryLimit,
         bundle = bundle,
         entry = entry,
-        modifiedBundleEntries = active.modifiedBundleEntries,
+        stagedSerializedFiles = active.stagedSerializedFiles,
       )
       res.onSuccess { sf ->
         updateActiveFile { file ->
-          file.copy(parsedSerializedFile = sf, activeBundleEntryPath = entry.path)
+          file.copy(
+            parsedSerializedFile = sf,
+            activeBundleEntryPath = entry.path,
+            stagedSerializedFiles = file.stagedSerializedFiles + (entry.path to sf),
+          )
         }
         _uiState.update {
           it.copy(
@@ -585,11 +590,20 @@ class AssetDeskViewModel(
       } else obj
     }
     val updatedSf = sf.copy(objects = updatedObjects)
-    updateActiveFile { file -> file.copy(parsedSerializedFile = updatedSf) }
-
-    // If inside an AssetBundle, also stage the re-serialized SerializedFile bytes into modifiedBundleEntries
     val bundle = active.parsedAssetBundle
     val bundleEntryPath = active.activeBundleEntryPath
+    updateActiveFile { file ->
+      file.copy(
+        parsedSerializedFile = updatedSf,
+        stagedSerializedFiles = if (bundleEntryPath != null) {
+          file.stagedSerializedFiles + (bundleEntryPath to updatedSf)
+        } else {
+          file.stagedSerializedFiles
+        },
+      )
+    }
+
+    // If inside an AssetBundle, also stage the re-serialized SerializedFile bytes into modifiedBundleEntries
     if (bundle != null && bundleEntryPath != null) {
       viewModelScope.launch {
         val sfBytesRes = safRepository.serializeActiveSerializedFileBytes(
@@ -598,13 +612,16 @@ class AssetDeskViewModel(
           parsedSf = updatedSf,
           bundle = bundle,
           bundleEntryPath = bundleEntryPath,
-          modifiedBundleEntries = active.modifiedBundleEntries,
         )
         sfBytesRes.onSuccess { newEntryBytes ->
           updateActiveFile { file ->
             file.copy(
               modifiedBundleEntries = file.modifiedBundleEntries + (bundleEntryPath to newEntryBytes),
             )
+          }
+        }.onFailure { err ->
+          _uiState.update {
+            it.copy(errorMessage = "Failed to stage bundle entry '$bundleEntryPath': ${err.message}")
           }
         }
       }
@@ -619,6 +636,23 @@ class AssetDeskViewModel(
 
   fun prepareSaveSerializedFileAs() {
     val active = _uiState.value.activeFile ?: return
+    val bundle = active.parsedAssetBundle
+    if (bundle != null && bundle.header.kind == UnityFileKind.ASSET_BUNDLE_FS) {
+      if (bundle.header.isReadOnly) {
+        _uiState.update { it.copy(errorMessage = bundle.header.readOnlyReason ?: "Bundle is read-only.") }
+        return
+      }
+      _uiState.update {
+        it.copy(
+          pendingExport = PendingExportPayload.RebuildBundleAs(
+            suggestedFileName = "rebuilt_${bundle.fileName}",
+            fileId = active.id,
+          ),
+        )
+      }
+      return
+    }
+
     val sf = active.parsedSerializedFile ?: return
     if (sf.header.isReadOnly) {
       _uiState.update { it.copy(errorMessage = sf.header.readOnlyReason ?: "File is read-only.") }
@@ -706,7 +740,35 @@ class AssetDeskViewModel(
 
     val applied = InstallerPackageManager.applyPackage(preview, sf)
     applied.onSuccess { updatedSf ->
-      updateActiveFile { it.copy(parsedSerializedFile = updatedSf) }
+      val bundle = active.parsedAssetBundle
+      val bundleEntryPath = active.activeBundleEntryPath
+      updateActiveFile { file ->
+        file.copy(
+          parsedSerializedFile = updatedSf,
+          stagedSerializedFiles = if (bundleEntryPath != null) {
+            file.stagedSerializedFiles + (bundleEntryPath to updatedSf)
+          } else {
+            file.stagedSerializedFiles
+          },
+        )
+      }
+      if (bundle != null && bundleEntryPath != null) {
+        viewModelScope.launch {
+          safRepository.serializeActiveSerializedFileBytes(
+            sourceUri = Uri.parse(active.uriString),
+            memoryLimitMb = _uiState.value.settings.memoryLimitMb,
+            parsedSf = updatedSf,
+            bundle = bundle,
+            bundleEntryPath = bundleEntryPath,
+          ).onSuccess { newEntryBytes ->
+            updateActiveFile { file ->
+              file.copy(
+                modifiedBundleEntries = file.modifiedBundleEntries + (bundleEntryPath to newEntryBytes),
+              )
+            }
+          }
+        }
+      }
       _uiState.update {
         it.copy(
           pendingPackagePreview = null,
@@ -755,7 +817,6 @@ class AssetDeskViewModel(
             parsedSf = sf,
             bundle = file.parsedAssetBundle,
             bundleEntryPath = file.activeBundleEntryPath,
-            modifiedBundleEntries = file.modifiedBundleEntries,
           )
           res.onSuccess {
             _uiState.update {
@@ -773,6 +834,14 @@ class AssetDeskViewModel(
         is PendingExportPayload.RebuildBundleAs -> {
           val file = _uiState.value.sessionFiles.firstOrNull { it.id == pending.fileId } ?: return@launch
           val bundle = file.parsedAssetBundle ?: return@launch
+          val staged = buildMap {
+            putAll(file.stagedSerializedFiles)
+            val entryPath = file.activeBundleEntryPath
+            val activeSf = file.parsedSerializedFile
+            if (entryPath != null && activeSf != null) {
+              put(entryPath, activeSf)
+            }
+          }
           _uiState.update { it.copy(parsingProgress = ParsingProgress(pending.suggestedFileName, 1, 1)) }
           val res = safRepository.saveRebuiltBundleToUri(
             sourceUri = Uri.parse(file.uriString),
@@ -780,12 +849,13 @@ class AssetDeskViewModel(
             memoryLimitMb = _uiState.value.settings.memoryLimitMb,
             bundle = bundle,
             replacedEntries = file.modifiedBundleEntries,
+            stagedSerializedFiles = staged,
           )
-          res.onSuccess {
+          res.onSuccess { usedCodec ->
             _uiState.update {
               it.copy(
                 parsingProgress = null,
-                statusMessage = "Rebuilt & verified UnityFS bundle '${pending.suggestedFileName}'.",
+                statusMessage = "Rebuilt & verified UnityFS bundle '${pending.suggestedFileName}' (${usedCodec.label}).",
               )
             }
           }.onFailure { err ->

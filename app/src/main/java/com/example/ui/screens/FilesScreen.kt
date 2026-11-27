@@ -195,12 +195,18 @@ fun FilesScreen(
         }
 
         if (activeFile != null && activeBundle != null) {
+          val modifiedEntryPaths = buildSet {
+            addAll(activeFile.modifiedBundleEntries.keys)
+            activeFile.stagedSerializedFiles.forEach { (path, sf) ->
+              if (sf.objects.any { it.isModified }) add(path)
+            }
+          }
           item {
             Spacer(modifier = Modifier.height(6.dp))
             AssetBundleOverviewCard(
               bundle = activeBundle,
-              modifiedCount = activeFile.modifiedBundleEntries.size,
-              canRebuildUnityFs = activeFile.kind == UnityFileKind.ASSET_BUNDLE_FS,
+              modifiedCount = modifiedEntryPaths.size,
+              canRebuildUnityFs = activeFile.kind == UnityFileKind.ASSET_BUNDLE_FS && !activeBundle.header.isReadOnly,
               onRebuildBundleAs = onRebuildBundleAs,
             )
           }
@@ -227,7 +233,7 @@ fun FilesScreen(
             BundleDirectoryEntryRow(
               entry = entry,
               isActive = entry.path == activeFile.activeBundleEntryPath,
-              isModified = entry.path in activeFile.modifiedBundleEntries,
+              isModified = entry.path in modifiedEntryPaths,
               onOpen = { onOpenBundleEntry(entry) },
               onExport = { onExportBundleEntry(entry) },
             )

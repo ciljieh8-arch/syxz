@@ -180,9 +180,11 @@ object UnityHeaderParser {
         add("Trailing data detected: actual file is ${actualLength - declaredSize} bytes larger than declared bundle size.")
       }
       if (compressionCode > 4) {
-        add("Unrecognized UnityFS compression flag ($compressionCode); decompression may fail in Milestone 4.")
+        add("Unrecognized UnityFS compression flag ($compressionCode); decompression may fail.")
       }
     }
+
+    val isWritableCodec = compressionCode in 0..3
 
     return HeaderParseResult.AssetBundleHeaderInfo(
       kind = UnityFileKind.ASSET_BUNDLE_FS,
@@ -197,8 +199,12 @@ object UnityHeaderParser {
       flags = flags,
       compressionHint = compressionHint,
       blocksInfoLocationHint = if (blocksAtEnd) "End of bundle" else "Immediately after header",
-      isReadOnly = true,
-      readOnlyReason = "Bundle decompression & rebuild are scheduled for Milestones 4 & 6.",
+      isReadOnly = !isWritableCodec,
+      readOnlyReason = if (isWritableCodec) {
+        null
+      } else {
+        "UnityFS compression codec ($compressionHint) is read-only; rebuilding supports None, LZMA, LZ4, and LZ4HC."
+      },
       warnings = warnings,
       firstBytesHex = firstBytesHex,
     )
@@ -304,7 +310,7 @@ object UnityHeaderParser {
       headerSize = headerSize,
       levelCount = levelCount,
       isReadOnly = true,
-      readOnlyReason = "Legacy AssetBundle block extraction & rebuilding are scheduled for Milestones 4 & 6.",
+      readOnlyReason = "Legacy $signature AssetBundles are opened in read-only inspection mode; only UnityFS supports rebuilding.",
       firstBytesHex = firstBytesHex,
     )
   }

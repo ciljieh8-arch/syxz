@@ -33,6 +33,7 @@ data class OpenedUnityFile(
   val parsedSerializedFile: ParsedSerializedFile? = null,
   val parsedAssetBundle: ParsedAssetBundle? = null,
   val activeBundleEntryPath: String? = null,
+  val stagedSerializedFiles: Map<String, ParsedSerializedFile> = emptyMap(),
   val modifiedBundleEntries: Map<String, ByteArray> = emptyMap(),
   val openedAtEpochMs: Long,
 ) {
@@ -44,6 +45,7 @@ data class OpenedUnityFile(
 
   val hasUnsavedChanges: Boolean
     get() = (parsedSerializedFile?.objects?.any { it.isModified } == true) ||
+      stagedSerializedFiles.values.any { sf -> sf.objects.any { it.isModified } } ||
       modifiedBundleEntries.isNotEmpty()
 }
 

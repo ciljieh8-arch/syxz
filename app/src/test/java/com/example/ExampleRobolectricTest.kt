@@ -19,7 +19,9 @@ import com.assetdesk.binary.ByteOrderMode
 import com.assetdesk.binary.Lz4Codec
 import com.assetdesk.model.TypeTreeNode
 import com.assetdesk.unity.HeaderParseResult
+import com.assetdesk.unity.ReadabilityStatus
 import com.assetdesk.unity.UnityFileKind
+import com.assetdesk.writer.BundleCompressionMode
 import com.example.data.SafFileRepository
 import com.example.ui.theme.AssetDeskTheme
 import com.example.ui.viewmodel.AssetDeskViewModel
@@ -177,6 +179,7 @@ class ExampleRobolectricTest {
     assertEquals(UnityFileKind.ASSET_BUNDLE_FS, opened.kind)
     val header = opened.parseResult as HeaderParseResult.AssetBundleHeaderInfo
     assertEquals("UnityFS", header.signature)
+    assertEquals(ReadabilityStatus.SUPPORTED_READ_WRITE, header.readability)
     val bundle = opened.parsedAssetBundle
     assertNotNull(bundle)
     assertEquals(1, bundle!!.directoryEntries.size)
@@ -185,6 +188,38 @@ class ExampleRobolectricTest {
     assertNotNull(sf)
     assertEquals(1, sf!!.objects.size)
     assertEquals("readme", sf.objects.first().assetName)
+
+    // Verify editing dump + staging + rebuilding UnityFS preserves LZ4 compression and succeeds without bounds error
+    val modifiedSf = sf.copy(
+      objects = sf.objects.map { obj ->
+        val writer = BinaryWriter(ByteOrderMode.LITTLE_ENDIAN)
+        writer.writeLengthPrefixedString("readme", alignAfter = true)
+        writer.writeLengthPrefixedString("updated_short", alignAfter = true)
+        obj.copy(modifiedRawBytes = writer.toByteArray(), status = com.assetdesk.model.ObjectStatus.MODIFIED)
+      },
+    )
+    val stagedBytes = repository.serializeActiveSerializedFileBytes(
+      sourceUri = Uri.fromFile(bundleFile),
+      memoryLimitMb = 32,
+      parsedSf = modifiedSf,
+      bundle = bundle,
+      bundleEntryPath = "CAB-test123",
+    ).getOrThrow()
+
+    // Inspecting / re-serializing again even after modifiedBundleEntries exists must still use original bundle source cleanly
+    val outBundleFile = tempFolder.newFile("rebuilt_sample.bundle")
+    val usedCodec = repository.saveRebuiltBundleToUri(
+      sourceUri = Uri.fromFile(bundleFile),
+      targetUri = Uri.fromFile(outBundleFile),
+      memoryLimitMb = 32,
+      bundle = bundle,
+      replacedEntries = mapOf("CAB-test123" to stagedBytes),
+      stagedSerializedFiles = mapOf("CAB-test123" to modifiedSf),
+    ).getOrThrow()
+    assertEquals(BundleCompressionMode.LZ4, usedCodec)
+
+    val reopened = repository.openAndParseUri(Uri.fromFile(outBundleFile), memoryLimitMb = 32).getOrThrow()
+    assertEquals(1, reopened.parsedSerializedFile!!.objects.size)
   }
 
   private fun buildSampleSerializedFileV15(): ByteArray {

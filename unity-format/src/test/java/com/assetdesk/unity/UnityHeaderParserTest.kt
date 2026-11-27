@@ -33,7 +33,23 @@ class UnityHeaderParserTest {
     assertEquals("2019.4.28f1", info.unityEngineRevision)
     assertEquals("LZ4HC", info.compressionHint)
     assertEquals(256L, info.declaredFileSize)
-    assertTrue(info.isReadOnly)
+    assertFalse(info.isReadOnly)
+    assertEquals(ReadabilityStatus.SUPPORTED_READ_WRITE, info.readability)
+
+    val lzhamBytes = buildUnityFsHeader(
+      version = 6,
+      playerVersion = "5.x.x",
+      engineRevision = "2019.4.28f1",
+      declaredSize = 256L,
+      compressedBlocksInfo = 64,
+      uncompressedBlocksInfo = 128,
+      flags = 0x44, // LZHAM (4)
+      actualTotalBytes = 256,
+    )
+    val lzhamInfo = UnityHeaderParser.parse(ByteArrayByteSource(lzhamBytes), "lzham.bundle")
+      as HeaderParseResult.AssetBundleHeaderInfo
+    assertTrue(lzhamInfo.isReadOnly)
+    assertEquals(ReadabilityStatus.READ_ONLY, lzhamInfo.readability)
   }
 
   @Test

@@ -112,6 +112,11 @@ class SafFileRepository(
           parsedSerializedFile = parsedSf,
           parsedAssetBundle = parsedBundle,
           activeBundleEntryPath = activeBundleEntry,
+          stagedSerializedFiles = if (activeBundleEntry != null && parsedSf != null) {
+            mapOf(activeBundleEntry to parsedSf)
+          } else {
+            emptyMap()
+          },
           openedAtEpochMs = System.currentTimeMillis(),
         )
       }.let { Result.success(it) }
@@ -133,10 +138,11 @@ class SafFileRepository(
     memoryLimitMb: Int,
     bundle: ParsedAssetBundle,
     entry: BundleDirectoryEntry,
-    modifiedBundleEntries: Map<String, ByteArray>,
+    stagedSerializedFiles: Map<String, ParsedSerializedFile>,
   ): Result<ParsedSerializedFile> = withContext(Dispatchers.IO) {
     try {
-      val entryBytes = modifiedBundleEntries[entry.path] ?: withSeekableSource(uri, bundle.fileName, memoryLimitMb) { source ->
+      stagedSerializedFiles[entry.path]?.let { return@withContext Result.success(it) }
+      val entryBytes = withSeekableSource(uri, bundle.fileName, memoryLimitMb) { source ->
         AssetBundleParser.extractEntryBytes(source, bundle, entry).getOrThrow()
       }
       SerializedFileParser.parse(ByteArrayByteSource(entryBytes), entry.path)
@@ -178,11 +184,10 @@ class SafFileRepository(
       val rawBytes = when {
         obj.modifiedRawBytes != null -> obj.modifiedRawBytes!!
         bundle != null && bundleEntryPath != null -> {
-          val entryBytes = modifiedBundleEntries[bundleEntryPath]
-            ?: withSeekableSource(uri, bundle.fileName, memoryLimitMb) { source ->
-              val entry = bundle.directoryEntries.first { it.path == bundleEntryPath }
-              AssetBundleParser.extractEntryBytes(source, bundle, entry).getOrThrow()
-            }
+          val entryBytes = withSeekableSource(uri, bundle.fileName, memoryLimitMb) { source ->
+            val entry = bundle.directoryEntries.first { it.path == bundleEntryPath }
+            AssetBundleParser.extractEntryBytes(source, bundle, entry).getOrThrow()
+          }
           SerializedFileParser.readObjectRawBytes(ByteArrayByteSource(entryBytes), obj, maxBytes)
         }
         else -> {
@@ -237,17 +242,15 @@ class SafFileRepository(
     parsedSf: ParsedSerializedFile,
     bundle: ParsedAssetBundle?,
     bundleEntryPath: String?,
-    modifiedBundleEntries: Map<String, ByteArray>,
   ): Result<Unit> = withContext(Dispatchers.IO) {
     try {
       val tempOut = if (bundle != null && bundleEntryPath != null) {
-        val baseEntryBytes = modifiedBundleEntries[bundleEntryPath]
-          ?: withSeekableSource(sourceUri, bundle.fileName, memoryLimitMb) { src ->
-            val entry = bundle.directoryEntries.first { it.path == bundleEntryPath }
-            AssetBundleParser.extractEntryBytes(src, bundle, entry).getOrThrow()
-          }
+        val originalEntryBytes = withSeekableSource(sourceUri, bundle.fileName, memoryLimitMb) { src ->
+          val entry = bundle.directoryEntries.first { it.path == bundleEntryPath }
+          AssetBundleParser.extractEntryBytes(src, bundle, entry).getOrThrow()
+        }
         SerializedFileWriter.writeAndVerifyToTempFile(
-          originalSource = ByteArrayByteSource(baseEntryBytes),
+          originalSource = ByteArrayByteSource(originalEntryBytes),
           parsedFile = parsedSf,
           tempDirectory = context.cacheDir,
         ).getOrThrow()
@@ -274,16 +277,14 @@ class SafFileRepository(
     parsedSf: ParsedSerializedFile,
     bundle: ParsedAssetBundle?,
     bundleEntryPath: String?,
-    modifiedBundleEntries: Map<String, ByteArray>,
   ): Result<ByteArray> = withContext(Dispatchers.IO) {
     try {
       val bytes = if (bundle != null && bundleEntryPath != null) {
-        val baseEntryBytes = modifiedBundleEntries[bundleEntryPath]
-          ?: withSeekableSource(sourceUri, bundle.fileName, memoryLimitMb) { src ->
-            val entry = bundle.directoryEntries.first { it.path == bundleEntryPath }
-            AssetBundleParser.extractEntryBytes(src, bundle, entry).getOrThrow()
-          }
-        SerializedFileWriter.serializeToByteArray(ByteArrayByteSource(baseEntryBytes), parsedSf)
+        val originalEntryBytes = withSeekableSource(sourceUri, bundle.fileName, memoryLimitMb) { src ->
+          val entry = bundle.directoryEntries.first { it.path == bundleEntryPath }
+          AssetBundleParser.extractEntryBytes(src, bundle, entry).getOrThrow()
+        }
+        SerializedFileWriter.serializeToByteArray(ByteArrayByteSource(originalEntryBytes), parsedSf)
       } else {
         withSeekableSource(sourceUri, parsedSf.fileName, memoryLimitMb) { src ->
           SerializedFileWriter.serializeToByteArray(src, parsedSf)
@@ -301,15 +302,35 @@ class SafFileRepository(
     memoryLimitMb: Int,
     bundle: ParsedAssetBundle,
     replacedEntries: Map<String, ByteArray>,
-    compressionMode: BundleCompressionMode = BundleCompressionMode.LZ4HC,
-  ): Result<Unit> = withContext(Dispatchers.IO) {
+    stagedSerializedFiles: Map<String, ParsedSerializedFile> = emptyMap(),
+    compressionMode: BundleCompressionMode? = null,
+  ): Result<BundleCompressionMode> = withContext(Dispatchers.IO) {
     try {
+      val effectiveCompression = compressionMode ?: AssetBundleWriter.detectPreferredCompressionMode(bundle)
       val tempBundle = withSeekableSource(sourceUri, bundle.fileName, memoryLimitMb) { src ->
+        val finalReplaced = replacedEntries.toMutableMap()
+        for ((entryPath, stagedSf) in stagedSerializedFiles) {
+          if (stagedSf.objects.any { it.isModified }) {
+            val entry = bundle.directoryEntries.firstOrNull { it.path == entryPath }
+              ?: throw IllegalStateException("Bundle entry '$entryPath' not found in source bundle.")
+            val originalEntryBytes = AssetBundleParser.extractEntryBytes(src, bundle, entry).getOrThrow()
+            val verifiedTemp = SerializedFileWriter.writeAndVerifyToTempFile(
+              originalSource = ByteArrayByteSource(originalEntryBytes),
+              parsedFile = stagedSf,
+              tempDirectory = context.cacheDir,
+            ).getOrThrow()
+            try {
+              finalReplaced[entryPath] = verifiedTemp.readBytes()
+            } finally {
+              verifiedTemp.delete()
+            }
+          }
+        }
         AssetBundleWriter.rebuildUnityFsToTempFile(
           originalSource = src,
           originalBundle = bundle,
-          replacedEntries = replacedEntries,
-          compressionMode = compressionMode,
+          replacedEntries = finalReplaced,
+          compressionMode = effectiveCompression,
           tempDirectory = context.cacheDir,
         ).getOrThrow()
       }
@@ -318,7 +339,7 @@ class SafFileRepository(
       } finally {
         tempBundle.delete()
       }
-      Result.success(Unit)
+      Result.success(effectiveCompression)
     } catch (t: Throwable) {
       Result.failure(t)
     }

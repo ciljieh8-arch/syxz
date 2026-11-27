@@ -32,6 +32,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
@@ -51,6 +52,7 @@ import com.assetdesk.model.PPtrReference
 import com.assetdesk.model.UnityObjectInfo
 import com.assetdesk.unity.HeaderParseResult
 import com.assetdesk.unity.ParsedSerializedFile
+import com.assetdesk.unity.UnityFileKind
 import com.example.model.OpenedUnityFile
 import com.example.ui.components.EngineeringPanel
 import com.example.ui.components.HeaderTelemetryPanel
@@ -218,32 +220,36 @@ fun InspectorScreen(
     }
 
     if (sf != null) {
-      TabRow(
+      val isUnityFsBundle = activeFile.parsedAssetBundle?.header?.kind == UnityFileKind.ASSET_BUNDLE_FS
+      val isContainerWritable = !(activeFile.parsedAssetBundle?.header?.isReadOnly ?: sf.header.isReadOnly)
+
+      ScrollableTabRow(
         selectedTabIndex = selectedTab.coerceIn(0, 3),
         containerColor = MaterialTheme.colorScheme.surface,
+        edgePadding = 12.dp,
       ) {
         Tab(
           selected = selectedTab == 0,
           onClick = { selectedTab = 0 },
-          text = { Text("Assets (${sf.objects.size})") },
+          text = { Text("Assets (${sf.objects.size})", maxLines = 1, softWrap = false) },
           modifier = Modifier.testTag("inspector_tab_assets"),
         )
         Tab(
           selected = selectedTab == 1,
           onClick = { selectedTab = 1 },
-          text = { Text("Externals (${sf.externals.size})") },
+          text = { Text("Externals (${sf.externals.size})", maxLines = 1, softWrap = false) },
           modifier = Modifier.testTag("inspector_tab_externals"),
         )
         Tab(
           selected = selectedTab == 2,
           onClick = { selectedTab = 2 },
-          text = { Text("Header") },
+          text = { Text("Header", maxLines = 1, softWrap = false) },
           modifier = Modifier.testTag("inspector_tab_header"),
         )
         Tab(
           selected = selectedTab == 3,
           onClick = { selectedTab = 3 },
-          text = { Text("Layout") },
+          text = { Text("Layout", maxLines = 1, softWrap = false) },
           modifier = Modifier.testTag("inspector_tab_layout"),
         )
       }
@@ -253,6 +259,8 @@ fun InspectorScreen(
           uiState = uiState,
           sf = sf,
           hasUnsavedChanges = activeFile.hasUnsavedChanges,
+          isUnityFsBundle = isUnityFsBundle,
+          isContainerWritable = isContainerWritable,
           onSearchQueryChange = onSearchQueryChange,
           onTypeFilterSelected = onTypeFilterSelected,
           onSortSelected = onSortSelected,
@@ -312,6 +320,8 @@ private fun AssetListTab(
   uiState: AssetDeskUiState,
   sf: ParsedSerializedFile,
   hasUnsavedChanges: Boolean,
+  isUnityFsBundle: Boolean,
+  isContainerWritable: Boolean,
   onSearchQueryChange: (String) -> Unit,
   onTypeFilterSelected: (String) -> Unit,
   onSortSelected: (AssetSortField) -> Unit,
@@ -321,6 +331,12 @@ private fun AssetListTab(
   onImportInstallerPackage: () -> Unit,
 ) {
   val objects = uiState.filteredSortedObjects
+  val saveLabel = when {
+    isUnityFsBundle && hasUnsavedChanges -> "Save Modified Bundle As..."
+    isUnityFsBundle -> "Save Bundle Copy As..."
+    hasUnsavedChanges -> "Save Modified As..."
+    else -> "Save Copy As..."
+  }
 
   LazyColumn(
     contentPadding = PaddingValues(16.dp),
@@ -331,46 +347,52 @@ private fun AssetListTab(
   ) {
     item {
       Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Button(
+          onClick = onSaveSerializedFileAs,
+          enabled = isContainerWritable && !sf.header.isReadOnly,
+          modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .testTag("save_serialized_as_button"),
+          shape = MaterialTheme.shapes.small,
+        ) {
+          Icon(Icons.Outlined.Save, contentDescription = null, modifier = Modifier.size(16.dp))
+          Spacer(modifier = Modifier.width(6.dp))
+          Text(
+            text = saveLabel,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+          )
+        }
+
         Row(
           modifier = Modifier.fillMaxWidth(),
           horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-          Button(
-            onClick = onSaveSerializedFileAs,
-            enabled = !sf.header.isReadOnly,
-            modifier = Modifier
-              .weight(1f)
-              .heightIn(min = 48.dp)
-              .testTag("save_serialized_as_button"),
-            shape = MaterialTheme.shapes.small,
-          ) {
-            Icon(Icons.Outlined.Save, contentDescription = null, modifier = Modifier.size(16.dp))
-            Spacer(modifier = Modifier.width(6.dp))
-            Text(if (hasUnsavedChanges) "Save Modified As..." else "Save Copy As...")
-          }
           OutlinedButton(
             onClick = onImportInstallerPackage,
             modifier = Modifier
+              .weight(1f)
               .heightIn(min = 48.dp)
               .testTag("import_adpkg_button"),
             shape = MaterialTheme.shapes.small,
           ) {
             Icon(Icons.Outlined.Inventory2, contentDescription = null, modifier = Modifier.size(16.dp))
             Spacer(modifier = Modifier.width(4.dp))
-            Text("Import .adpkg")
+            Text("Import .adpkg", maxLines = 1, overflow = TextOverflow.Ellipsis)
           }
-        }
 
-        if (hasUnsavedChanges) {
-          OutlinedButton(
-            onClick = onCreateInstallerPackage,
-            modifier = Modifier
-              .fillMaxWidth()
-              .heightIn(min = 48.dp)
-              .testTag("export_adpkg_button"),
-            shape = MaterialTheme.shapes.small,
-          ) {
-            Text("Export Installer Package (.adpkg) from Modified Assets")
+          if (hasUnsavedChanges) {
+            OutlinedButton(
+              onClick = onCreateInstallerPackage,
+              modifier = Modifier
+                .weight(1f)
+                .heightIn(min = 48.dp)
+                .testTag("export_adpkg_button"),
+              shape = MaterialTheme.shapes.small,
+            ) {
+              Text("Export .adpkg", maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
           }
         }
 
