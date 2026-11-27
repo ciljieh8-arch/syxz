@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="graphite_bg">#FF111418</color>
+    <color name="charcoal_surface">#FF191E26</color>
+    <color name="muted_mint">#FF5CD6B3</color>
+    <color name="steel_blue">#FF6E96B8</color>
+    <color name="ic_launcher_bg">#FF12171A</color>
+</resources>

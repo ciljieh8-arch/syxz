@@ -1,0 +1,6 @@
+{
+  "name": "AssetDesk Mobile",
+  "description": "Native Android Unity Asset Editor and inspector inspired by UABE for local binary asset and bundle analysis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
